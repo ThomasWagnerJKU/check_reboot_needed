@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Thomas Wagner
+"""check_reboot_needed - Nagios/Icinga plugin: is a reboot pending, and for how long?
+
+Signals, all readable without root:
+  kernel  the newest installed kernel image (/boot/vmlinuz-*, /boot/Image-*, /boot/vmlinux-*) of the
+          running kernel's flavor (amd64, generic, default, rpi-v8, ...) is not the running one
+          (`uname -r`); since = ctime of that image = install time (the mtime is the build time)
+  flag    /run/reboot-required (Debian/Ubuntu; packages from /run/reboot-required.pkgs) or
+          /run/reboot-needed (openSUSE/SLES zypper); since = mtime of the flag file
+  zypper  `zypper needs-rebooting` exits 102 (openSUSE/SLES: glibc, systemd, ... updated);
+          since = newest change of the rpm database
+
+The state depends on how long the oldest reason has been pending: WARNING from -w days,
+CRITICAL from -c days.
+"""
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "0.1"
+OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
+STATE = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+ZYPPER_NEEDS_REBOOT = 102
+
+
+def natural_key(text):
+    """Sort key that compares digit runs as numbers: 6.12.118 > 6.12.99, -151- > -149-."""
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.split(r"(\d+)", text) if t]
+
+
+def flavor(release):
+    """Trailing '-'-separated parts that start with a letter.
+
+    6.8.0-151-generic -> generic, 6.18.60+rpt-rpi-v8 -> rpi-v8, 6.12.0-160000.41-default -> default,
+    6.12.118+deb13-amd64 -> amd64, 6.12.115+deb13.1-cloud-amd64 -> cloud-amd64
+    """
+    tail = []
+    for part in reversed(release.split("-")[1:]):
+        if not part[:1].isalpha():
+            break
+        tail.insert(0, part)
+    return "-".join(tail)
+
+
+def kernel_reason(root, running):
+    """(since, text) if a newer kernel of the running flavor is installed, plus a problem text or None."""
+    images = {}
+    for pattern in ("vmlinuz-*", "Image-*", "vmlinux-*"):
+        for path in glob.glob(os.path.join(root, "boot", pattern)):
+            release = os.path.basename(path).split("-", 1)[1]
+            if release.endswith((".old", ".bak", ".gz")) or "rescue" in release:
+                continue
+            images.setdefault(release, path)
+    same = [r for r in images if flavor(r) == flavor(running)]
+    if not same:
+        # e.g. Raspberry Pi OS with only kernel*.img in /boot/firmware: nothing to compare
+        return None, None
+    newest = max(same, key=natural_key)
+    if newest == running:
+        return None, None
+    try:
+        since = os.stat(images[newest]).st_ctime
+    except OSError as err:
+        return None, "cannot stat %s: %s" % (images[newest], err)
+    return (since, "kernel %s installed, running %s" % (newest, running)), None
+
+
+def flag_reasons(root):
+    found = []
+    for name, pkgs in (("reboot-required", "reboot-required.pkgs"), ("reboot-needed", None)):
+        path = os.path.join(root, "run", name)
+        try:
+            since = os.stat(path).st_mtime
+        except OSError:
+            continue
+        text = "flag /run/%s" % name
+        if pkgs:
+            try:
+                with open(os.path.join(root, "run", pkgs)) as handle:
+                    names = sorted(set(handle.read().split()))
+                if names:
+                    text += " (%s)" % ", ".join(names)
+            except OSError:
+                pass
+        found.append((since, text))
+    return found
+
+
+def zypper_reason(root, zypper, timeout):
+    if not zypper:
+        return None, None
+    try:
+        res = subprocess.run([zypper, "-q", "--non-interactive", "needs-rebooting"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=timeout, env=dict(os.environ, LC_ALL="C"))
+    except subprocess.TimeoutExpired:
+        return None, "zypper needs-rebooting timed out after %d s" % timeout
+    except OSError as err:
+        return None, "zypper needs-rebooting failed: %s" % err
+    if res.returncode == ZYPPER_NEEDS_REBOOT:
+        dbs = glob.glob(os.path.join(root, "usr/lib/sysimage/rpm/*")) + glob.glob(os.path.join(root, "var/lib/rpm/*"))
+        since = max((os.stat(p).st_mtime for p in dbs), default=time.time())
+        return (since, "zypper needs-rebooting: core libraries or services were updated"), None
+    if res.returncode != 0:
+        out = " ".join(res.stdout.decode(errors="replace").split())[:200]
+        return None, "zypper needs-rebooting exited %d: %s" % (res.returncode, out)
+    return None, None
+
+
+def days(text):
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return value
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        """Usage errors are UNKNOWN for Nagios, not argparse's exit code 2 (= CRITICAL)."""
+        self.print_usage(sys.stderr)
+        print("REBOOT UNKNOWN - %s" % message)
+        sys.exit(UNKNOWN)
+
+
+def parse_args(argv):
+    p = Parser(description="Check whether a reboot is pending and for how many days.")
+    p.add_argument("-w", "--warning", type=days, default=0,
+                   help="days a reboot may be pending before WARNING (default: 0 = at once)")
+    p.add_argument("-c", "--critical", type=days, default=None,
+                   help="days a reboot may be pending before CRITICAL (default: never)")
+    p.add_argument("--no-zypper", action="store_true", help="do not run zypper needs-rebooting")
+    p.add_argument("--zypper", default=None, help="path of zypper (default: searched in PATH)")
+    p.add_argument("-t", "--timeout", type=int, default=40, help="timeout for zypper in seconds (default: 40)")
+    p.add_argument("--root", default="/", help=argparse.SUPPRESS)        # tests: fake file tree
+    p.add_argument("--release", default=None, help=argparse.SUPPRESS)    # tests: fake `uname -r`
+    p.add_argument("-V", "--version", action="version", version="check_reboot_needed %s" % VERSION)
+    args = p.parse_args(argv)
+    if args.critical is not None and args.critical < args.warning:
+        p.error("-c must not be smaller than -w")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    now = time.time()
+    running = args.release or os.uname().release
+    try:
+        with open(os.path.join(args.root, "proc/uptime")) as handle:
+            uptime_days = float(handle.read().split()[0]) / 86400
+    except (OSError, ValueError, IndexError):
+        uptime_days = None
+
+    reasons, problems = [], []
+    reason, problem = kernel_reason(args.root, running)
+    reasons += [reason] if reason else []
+    problems += [problem] if problem else []
+    reasons += flag_reasons(args.root)
+    if not args.no_zypper:
+        reason, problem = zypper_reason(args.root, args.zypper or shutil.which("zypper"), args.timeout)
+        reasons += [reason] if reason else []
+        problems += [problem] if problem else []
+
+    if reasons:
+        reasons.sort()
+        pending = max(0.0, (now - reasons[0][0]) / 86400)
+        state = OK
+        if args.critical is not None and pending >= args.critical:
+            state = CRITICAL
+        elif pending >= args.warning:
+            state = WARNING
+        text = "reboot pending for %.1f days" % pending
+    else:
+        pending = 0.0
+        state = UNKNOWN if problems else OK
+        text = "; ".join(problems) if problems else "no reboot pending"
+    if uptime_days is not None:
+        text += ", up %.1f days" % uptime_days
+
+    details = ["%s (since %s)" % (t, time.strftime("%Y-%m-%d %H:%M", time.localtime(s))) for s, t in reasons]
+    if reasons:
+        details += problems
+        text += " - " + details.pop(0)
+    perf = "pending_days=%.2f;%s;%s;0;" % (pending, "%g" % args.warning,
+                                           "" if args.critical is None else "%g" % args.critical)
+    if uptime_days is not None:
+        perf += " uptime_days=%.2f;;;0;" % uptime_days
+    print("REBOOT %s - %s | %s" % (STATE[state], text, perf))
+    for line in details:
+        print(line)
+    return state
+
+
+if __name__ == "__main__":
+    sys.exit(main())

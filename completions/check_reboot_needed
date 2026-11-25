@@ -1,0 +1,19 @@
+# bash completion for check_reboot_needed                     -*- shell-script -*-
+
+_check_reboot_needed()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    COMPREPLY=()
+    case $prev in
+        --zypper)
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        -w | --warning | -c | --critical | -t | --timeout)
+            return
+            ;;
+    esac
+    mapfile -t COMPREPLY < <(compgen -W '-h --help -V --version -w --warning -c --critical
+        --no-zypper --zypper -t --timeout' -- "$cur")
+}
+complete -F _check_reboot_needed check_reboot_needed
